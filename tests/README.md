@@ -1,117 +1,234 @@
 # AMap validation for the C implementation
 
-`validate_amap.py` compares the repository's current C `wgs2gcj()` implementation with AMap's coordinate conversion Web Service.
+The repository contains a staged external validation workflow for the current C `wgs2gcj()` implementation.
 
-The validator uses only the Python standard library. It does **not** contain an AMap key and does not write the key to output files.
+It compares eviltransform with AMap's coordinate-conversion Web Service instead of only checking an internal `WGS84 -> GCJ-02 -> WGS84` round trip.
 
-## What it validates
+Only Python standard-library modules are used. The AMap key is read from the `AMAP_KEY` environment variable and is never stored in the repository or written to result files.
 
-For every WGS84 test point:
+## Recommended two-stage workflow
 
-1. The script compiles the current `c/transform.c` with a temporary C harness.
-2. The compiled program calls `wgs2gcj()`.
-3. The same WGS84 coordinate is sent to AMap with `coordsys=gps`.
-4. The two GCJ-02 coordinates are compared in meters.
-5. Detailed and summary CSV reports are generated.
+Use the staged entry point:
 
-This avoids the weak test pattern of only checking `WGS84 -> GCJ-02 -> WGS84`, which can prove internal consistency but cannot prove compatibility with an external GCJ-02 implementation.
-
-## AMap API requirements
-
-Use a **Web Service API** key.
-
-Official coordinate-conversion documentation:
-
-https://lbs.amap.com/api/webservice/guide/api/convert
-
-The AMap Web Service documentation specifies that:
-
-- input order is `longitude,latitude`;
-- `coordsys=gps` is used for GPS/WGS84 input;
-- input coordinates may contain at most 6 digits after the decimal point;
-- one request supports at most 40 coordinate pairs.
-
-The validator therefore rounds each input point to 6 decimal places and uses the exact same rounded coordinate for both eviltransform and AMap. Requests are batched with at most 40 points.
-
-## Requirements
-
-- Python 3
-- Internet access to `restapi.amap.com`
-- A C compiler:
-  - `gcc`, `clang`, or `cc`; or
-  - MSVC `cl` from a Visual Studio Developer Command Prompt
-- an AMap Web Service API key
-
-No third-party Python packages are required.
-
-## Run on Windows PowerShell
-
-```powershell
-$env:AMAP_KEY="your-web-service-key"
-python tests/validate_amap.py
+```text
+tests/run_amap_validation.py
 ```
 
-## Run on cmd.exe
+Two modes are available:
 
-```bat
-set AMAP_KEY=your-web-service-key
-python tests\validate_amap.py
+- `smoke`: small, fast sanity check. This is the default and should always be run first.
+- `full`: larger comparison after the smoke test passes.
+
+The underlying implementation is still performed by:
+
+```text
+tests/validate_amap.py
 ```
 
-If the compiler is not auto-detected:
+That script compiles the repository's current `c/transform.c`, runs its real `wgs2gcj()` function, calls AMap for the same WGS84 coordinates, and compares the resulting GCJ-02 coordinates.
 
-```bat
-python tests\validate_amap.py --compiler gcc
+## Why smoke first?
+
+The smoke test is intended to catch basic failures before consuming more API calls:
+
+- invalid or unavailable AMap Web Service key;
+- no working C compiler;
+- longitude/latitude order problems;
+- network/API failures;
+- a clearly incompatible GCJ-02 implementation.
+
+The smoke set currently contains six geographically distributed points:
+
+```text
+Beijing
+Shanghai
+Guangzhou
+Chengdu
+Urumqi
+Haikou
 ```
 
-or run from a Visual Studio Developer Command Prompt so that `cl.exe` is on `PATH`.
+If these points show tens or hundreds of meters of difference, stop and investigate before running the full comparison.
 
-## Input CSV
+## Full validation size
 
-Default input:
+The full-mode anchor file is:
 
 ```text
 tests/amap_test_points.csv
 ```
 
-Required columns:
-
-```csv
-name,wgs_lat,wgs_lon
-Beijing,39.908823,116.397470
-```
-
-Additional points can be added. The coordinates are treated as WGS84 inputs; they do not need to be survey control points because the test compares two transformations of the same input coordinate.
-
-## Output
-
-Generated under:
+By default, `run_amap_validation.py --mode full` generates a deterministic 5 x 5 local grid around every anchor:
 
 ```text
-tests/output/
+grid radius = 2
+grid step   = 0.05 degree
 ```
 
-Detailed result:
+With the current 15 anchors:
 
 ```text
-amap_compare_result.csv
+15 anchors x 25 points = 375 test points
 ```
 
-Columns include:
+AMap supports at most 40 coordinate pairs per conversion request, so the default full test requires 10 requests.
+
+The generated full input is saved as:
+
+```text
+tests/output/full/generated_full_points.csv
+```
+
+You can increase or decrease the coverage with `--grid-radius` and `--grid-step-deg`.
+
+## macOS requirements
+
+- Python 3
+- Internet access to `restapi.amap.com`
+- AMap **Web Service API** key
+- a C compiler
+
+macOS normally already exposes Apple Clang through `cc` or `clang` when Xcode Command Line Tools are installed.
+
+Check:
+
+```bash
+clang --version
+```
+
+If necessary:
+
+```bash
+xcode-select --install
+```
+
+No third-party Python packages such as `requests`, `numpy`, or `pandas` are required.
+
+## Run on macOS
+
+Set the AMap key for the current shell:
+
+```bash
+export AMAP_KEY="your-web-service-key"
+```
+
+### Stage 1: smoke test
+
+```bash
+python3 tests/run_amap_validation.py --mode smoke
+```
+
+`--mode smoke` is also the default, so this is equivalent to:
+
+```bash
+python3 tests/run_amap_validation.py
+```
+
+Expected output directory:
+
+```text
+tests/output/smoke/
+```
+
+Only continue to full validation after the smoke test succeeds.
+
+### Stage 2: full validation
+
+```bash
+python3 tests/run_amap_validation.py --mode full
+```
+
+Expected output directory:
+
+```text
+tests/output/full/
+```
+
+If compiler auto-detection fails, explicitly select Apple Clang:
+
+```bash
+python3 tests/run_amap_validation.py --mode smoke --compiler clang
+```
+
+and then:
+
+```bash
+python3 tests/run_amap_validation.py --mode full --compiler clang
+```
+
+## Adjust the full test size
+
+Default:
+
+```bash
+python3 tests/run_amap_validation.py --mode full
+```
+
+uses a 5 x 5 grid around each anchor.
+
+Smaller full test, 3 x 3 per anchor:
+
+```bash
+python3 tests/run_amap_validation.py --mode full --grid-radius 1
+```
+
+Larger test, 7 x 7 per anchor:
+
+```bash
+python3 tests/run_amap_validation.py --mode full --grid-radius 3
+```
+
+Change local spacing:
+
+```bash
+python3 tests/run_amap_validation.py --mode full --grid-step-deg 0.02
+```
+
+For the current 15 anchors:
+
+- radius `1`: 135 points;
+- radius `2`: 375 points;
+- radius `3`: 735 points.
+
+## AMap API handling
+
+The validator follows the AMap coordinate-conversion interface conventions used by this repository:
+
+- input order: `longitude,latitude`;
+- `coordsys=gps` for GPS/WGS84 input;
+- coordinates normalized to 6 decimal places;
+- at most 40 coordinate pairs per request.
+
+The exact same rounded WGS84 coordinate is sent to both eviltransform and AMap so the comparison does not mix input-precision differences with transformation differences.
+
+## Output files
+
+Each mode writes its own files and does not overwrite the other mode.
+
+Smoke:
+
+```text
+tests/output/smoke/amap_compare_result.csv
+tests/output/smoke/amap_compare_summary.csv
+```
+
+Full:
+
+```text
+tests/output/full/generated_full_points.csv
+tests/output/full/amap_compare_result.csv
+tests/output/full/amap_compare_summary.csv
+```
+
+The detailed CSV contains:
 
 - WGS84 input;
 - eviltransform GCJ-02 result;
 - AMap GCJ-02 result;
 - latitude/longitude difference in degrees;
-- two-dimensional distance error in meters.
+- two-dimensional difference in meters.
 
-Summary:
-
-```text
-amap_compare_summary.csv
-```
-
-Statistics include:
+The summary contains:
 
 - count;
 - mean error;
@@ -131,22 +248,43 @@ The default engineering threshold is:
 max error <= 5 m
 ```
 
-This is a repository validation threshold, **not an official accuracy guarantee from AMap**.
+This is a repository validation threshold, not an official AMap accuracy guarantee.
 
 Change it with:
 
-```bat
-python tests\validate_amap.py --max-error-m 2
+```bash
+python3 tests/run_amap_validation.py --mode smoke --max-error-m 2
+```
+
+or:
+
+```bash
+python3 tests/run_amap_validation.py --mode full --max-error-m 2
 ```
 
 Disable threshold-based failure while collecting data:
 
-```bat
-python tests\validate_amap.py --max-error-m 0
+```bash
+python3 tests/run_amap_validation.py --mode full --max-error-m 0
 ```
 
-Exit codes:
+Exit codes propagated from the core validator:
 
 - `0`: PASS, or threshold disabled;
 - `1`: setup/compile/network/API error;
 - `2`: comparison completed but maximum error exceeded the configured threshold.
+
+## Direct core-validator use
+
+For custom CSV input, `validate_amap.py` can still be called directly:
+
+```bash
+python3 tests/validate_amap.py --points my_points.csv --output-dir tests/output/custom
+```
+
+Required CSV columns:
+
+```csv
+name,wgs_lat,wgs_lon
+Beijing,39.908823,116.397470
+```

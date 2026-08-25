@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Validate eviltransform C WGS84->GCJ-02 results against AMap.
+"""Validate eviltransform C WGS84->GCJ-02 output against AMap.
 
-This script uses only the Python standard library.
+Only Python standard-library modules are used.
 
-It performs the following steps:
-  1. Reads WGS84 test points from CSV.
-  2. Compiles the repository's current c/transform.c with a tiny temporary
-     test harness (gcc/clang/cc or MSVC cl).
-  3. Runs the compiled C implementation for all test points.
-  4. Calls AMap's coordinate conversion service with coordsys=gps.
-  5. Compares eviltransform GCJ-02 output with AMap output.
-  6. Writes detailed per-point results and summary statistics to CSV.
+Workflow:
+  1. Read WGS84 test points from CSV.
+  2. Compile the repository's current c/transform.c with a temporary C harness.
+  3. Run wgs2gcj() for every test point.
+  4. Query AMap's coordinate conversion service with coordsys=gps.
+  5. Compare the two GCJ-02 results.
+  6. Write detailed and summary CSV reports.
 
-The AMap key is read only from the AMAP_KEY environment variable and is
-never written to output files.
+The AMap key is read from the AMAP_KEY environment variable and is never
+written to output files.
 
 Examples:
 
@@ -26,11 +25,11 @@ Examples:
     set AMAP_KEY=your-key
     python tests\validate_amap.py
 
-    # Explicit compiler / threshold
+    # Select compiler / threshold
     python tests/validate_amap.py --compiler gcc --max-error-m 5
 
 Exit codes:
-    0: validation completed and threshold passed (or threshold disabled)
+    0: validation passed, or threshold checking was disabled
     1: setup, compilation, file, network, or AMap API failure
     2: validation completed but max error exceeded --max-error-m
 """
@@ -97,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compiler",
         default=None,
-        help="compiler executable (otherwise CC, cc, gcc, clang, cl are tried)",
+        help="compiler executable; otherwise CC, cc, gcc, clang, cl are tried",
     )
     parser.add_argument(
         "--timeout",
@@ -122,8 +121,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_MAX_ERROR_M,
         help=(
-            "fail with exit code 2 if max error exceeds this value; "
-            "use 0 to disable (default: 5 m)"
+            "exit 2 if max error exceeds this value; "
+            "use 0 to disable threshold checking (default: 5 m)"
         ),
     )
     return parser.parse_args()
@@ -177,23 +176,22 @@ def read_points(path: Path) -> list[dict[str, object]]:
 
 
 def find_compiler(explicit: str | None) -> str:
-    candidates: list[str] = []
     if explicit:
-        candidates.append(explicit)
+        candidates = [explicit]
     elif os.environ.get("CC"):
-        candidates.append(os.environ["CC"])
+        candidates = [os.environ["CC"]]
     else:
-        candidates.extend(["cc", "gcc", "clang", "cl"])
+        candidates = ["cc", "gcc", "clang", "cl"]
 
     for candidate in candidates:
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
 
-    shown = ", ".join(candidates)
     raise RuntimeError(
-        "no C compiler found. Tried: " + shown + ". "
-        "Install gcc/clang, run from a Visual Studio Developer Command Prompt, "
+        "no C compiler found. Tried: "
+        + ", ".join(candidates)
+        + ". Install gcc/clang, run from a Visual Studio Developer Command Prompt, "
         "or pass --compiler / set CC."
     )
 
@@ -214,10 +212,12 @@ def build_c_runner(
         raise FileNotFoundError(f"transform.h not found in: {include_dir}")
 
     harness = build_dir / "amap_validation_runner.c"
-    exe = build_dir / ("amap_validation_runner.exe" if os.name == "nt" else "amap_validation_runner")
+    exe = build_dir / (
+        "amap_validation_runner.exe" if os.name == "nt" else "amap_validation_runner"
+    )
 
     harness.write_text(
-        """#include <stdio.h>\n"
+        "#include <stdio.h>\n"
         "#include \"transform.h\"\n"
         "\n"
         "int main(void) {\n"
@@ -228,7 +228,7 @@ def build_c_runner(
         "        printf(\"%.15f %.15f\\n\", gcjLat, gcjLon);\n"
         "    }\n"
         "    return 0;\n"
-        "}\n""",
+        "}\n",
         encoding="utf-8",
     )
 
@@ -277,8 +277,13 @@ def build_c_runner(
     return exe
 
 
-def run_c_transform(exe: Path, points: list[dict[str, object]]) -> list[tuple[float, float]]:
-    stdin_text = "".join(f"{p['lat']:.15f} {p['lon']:.15f}\n" for p in points)
+def run_c_transform(
+    exe: Path,
+    points: list[dict[str, object]],
+) -> list[tuple[float, float]]:
+    stdin_text = "".join(
+        f"{float(p['lat']):.15f} {float(p['lon']):.15f}\n" for p in points
+    )
     proc = subprocess.run(
         [str(exe)],
         input=stdin_text,
@@ -310,7 +315,13 @@ def run_c_transform(exe: Path, points: list[dict[str, object]]) -> list[tuple[fl
     return result
 
 
-def amap_convert(lat: float, lon: float, key: str, timeout: float, retries: int) -> tuple[float, float]:
+def amap_convert(
+    lat: float,
+    lon: float,
+    key: str,
+    timeout: float,
+    retries: int,
+) -> tuple[float, float]:
     params = urllib.parse.urlencode(
         {
             "key": key,
@@ -318,9 +329,8 @@ def amap_convert(lat: float, lon: float, key: str, timeout: float, retries: int)
             "coordsys": "gps",
         }
     )
-    url = f"{AMAP_URL}?{params}"
     request = urllib.request.Request(
-        url,
+        f"{AMAP_URL}?{params}",
         headers={"User-Agent": "eviltransform-amap-validator/1.0"},
     )
 
@@ -349,14 +359,22 @@ def amap_convert(lat: float, lon: float, key: str, timeout: float, retries: int)
             return gcj_lat, gcj_lon
 
         except RuntimeError:
-            # API-level errors (bad key, quota, invalid request) should not be retried.
+            # API errors such as invalid keys or quota failures should not be retried.
             raise
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
             last_error = exc
             if attempt < retries:
-                time.sleep(0.5 * (2 ** attempt))
+                time.sleep(0.5 * (2**attempt))
 
-    raise RuntimeError(f"AMap request failed after {retries + 1} attempts: {last_error}")
+    raise RuntimeError(
+        f"AMap request failed after {retries + 1} attempts: {last_error}"
+    )
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -507,7 +525,10 @@ def main() -> int:
             ("p99_error_m", f"{p99:.6f}"),
             ("max_error_m", f"{max_error:.6f}"),
             ("worst_point", worst_name),
-            ("max_error_threshold_m", f"{args.max_error_m:.6f}" if threshold_enabled else "disabled"),
+            (
+                "max_error_threshold_m",
+                f"{args.max_error_m:.6f}" if threshold_enabled else "disabled",
+            ),
             ("validation", "PASS" if passed else "FAIL"),
             ("compiler", compiler),
             ("c_source", str(args.c_source)),

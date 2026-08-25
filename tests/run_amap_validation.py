@@ -33,6 +33,8 @@ DEFAULT_RANDOM_COUNT = 50_000
 DEFAULT_RANDOM_SEED = 20260825
 DEFAULT_GRID_RADIUS = 2
 DEFAULT_GRID_STEP_DEG = 0.05
+DEFAULT_REQUEST_DELAY_SEC = 0.50
+DEFAULT_RETRIES = 5
 AMAP_BATCH_SIZE = 40
 MASK64 = (1 << 64) - 1
 
@@ -68,8 +70,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compiler", default=None)
     p.add_argument("--max-error-m", type=float, default=5.0)
     p.add_argument("--timeout", type=float, default=15.0)
-    p.add_argument("--retries", type=int, default=2)
-    p.add_argument("--request-delay", type=float, default=0.10)
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    p.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY_SEC,
+        help=(
+            "delay between AMap requests in seconds; default 0.50 keeps the "
+            "request rate comfortably below the documented 3 QPS personal "
+            "coordinate-conversion limit"
+        ),
+    )
     p.add_argument("--grid-radius", type=int, default=DEFAULT_GRID_RADIUS)
     p.add_argument("--grid-step-deg", type=float, default=DEFAULT_GRID_STEP_DEG)
     p.add_argument(
@@ -319,12 +330,15 @@ def main() -> int:
             ("point_count", point_count),
             ("amap_batch_size", AMAP_BATCH_SIZE),
             ("estimated_amap_requests", batches),
+            ("request_delay_sec", f"{max(0.0, args.request_delay):.3f}"),
+            ("retries", max(0, args.retries)),
             ("max_error_m", args.max_error_m),
         ]
         write_manifest(output_dir / "sampling_manifest.csv", manifest)
 
         print(f"Points       : {point_count}")
         print(f"AMap batches : {batches} (max {AMAP_BATCH_SIZE} points/request)")
+        print(f"Request delay: {max(0.0, args.request_delay):.3f} s")
         print(f"Output dir   : {output_dir}")
         print()
 

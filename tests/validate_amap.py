@@ -6,11 +6,14 @@ Only Python standard-library modules are used.
 
 Workflow:
   1. Read WGS84 test points from CSV.
-  2. Compile the repository's current c/transform.c with a temporary C harness.
-  3. Run wgs2gcj() for every test point.
-  4. Query AMap's coordinate conversion service with coordsys=gps.
-  5. Compare the two GCJ-02 results.
-  6. Write detailed and summary CSV reports.
+  2. Normalize input coordinates to 6 decimal places, matching AMap's
+     documented coordinate-conversion input precision.
+  3. Compile the repository's current c/transform.c with a temporary C harness.
+  4. Run wgs2gcj() for every normalized test point.
+  5. Query AMap's coordinate conversion service with coordsys=gps, in batches
+     of at most 40 coordinate pairs per request.
+  6. Compare the two GCJ-02 results.
+  7. Write detailed and summary CSV reports.
 
 The AMap key is read from the AMAP_KEY environment variable and is never
 written to output files.
@@ -56,6 +59,8 @@ import urllib.request
 
 EARTH_R = 6378137.0
 AMAP_URL = "https://restapi.amap.com/v3/assistant/coordinate/convert"
+AMAP_MAX_BATCH = 40
+AMAP_INPUT_DECIMALS = 6
 DEFAULT_MAX_ERROR_M = 5.0
 
 
@@ -114,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         "--request-delay",
         type=float,
         default=0.05,
-        help="delay between AMap requests in seconds (default: 0.05)",
+        help="delay between AMap batches in seconds (default: 0.05)",
     )
     parser.add_argument(
         "--max-error-m",
@@ -165,6 +170,12 @@ def read_points(path: Path) -> list[dict[str, object]]:
                 raise ValueError(f"{path}:{line_no}: latitude out of range: {lat}")
             if not -180.0 <= lon <= 180.0:
                 raise ValueError(f"{path}:{line_no}: longitude out of range: {lon}")
+
+            # AMap's Web Service coordinate conversion API documents a maximum
+            # of 6 digits after the decimal point. Use the exact same rounded
+            # coordinates for both eviltransform and AMap.
+            lat = round(lat, AMAP_INPUT_DECIMALS)
+            lon = round(lon, AMAP_INPUT_DECIMALS)
 
             names.add(name)
             points.append({"name": name, "lat": lat, "lon": lon})
@@ -282,7 +293,7 @@ def run_c_transform(
     points: list[dict[str, object]],
 ) -> list[tuple[float, float]]:
     stdin_text = "".join(
-        f"{float(p['lat']):.15f} {float(p['lon']):.15f}\n" for p in points
+        f"{float(p['lat']):.6f} {float(p['lon']):.6f}\n" for p in points
     )
     proc = subprocess.run(
         [str(exe)],
@@ -315,18 +326,26 @@ def run_c_transform(
     return result
 
 
-def amap_convert(
-    lat: float,
-    lon: float,
+def amap_convert_batch(
+    points: list[dict[str, object]],
     key: str,
     timeout: float,
     retries: int,
-) -> tuple[float, float]:
+) -> list[tuple[float, float]]:
+    if not points:
+        return []
+    if len(points) > AMAP_MAX_BATCH:
+        raise ValueError(f"AMap batch exceeds {AMAP_MAX_BATCH} points")
+
+    locations = "|".join(
+        f"{float(p['lon']):.6f},{float(p['lat']):.6f}" for p in points
+    )
     params = urllib.parse.urlencode(
         {
             "key": key,
-            "locations": f"{lon:.15f},{lat:.15f}",
+            "locations": locations,
             "coordsys": "gps",
+            "output": "JSON",
         }
     )
     request = urllib.request.Request(
@@ -346,17 +365,25 @@ def amap_convert(
                 infocode = data.get("infocode", "unknown")
                 raise RuntimeError(f"AMap API error: {info} (infocode={infocode})")
 
-            locations = data.get("locations")
-            if not isinstance(locations, str):
+            locations_out = data.get("locations")
+            if not isinstance(locations_out, str):
                 raise RuntimeError(f"AMap response has no locations field: {payload}")
 
-            parts = locations.split(",")
-            if len(parts) != 2:
-                raise RuntimeError(f"unexpected AMap locations field: {locations!r}")
+            output_pairs = locations_out.split(";")
+            if len(output_pairs) != len(points):
+                raise RuntimeError(
+                    f"AMap returned {len(output_pairs)} points for {len(points)} inputs"
+                )
 
-            gcj_lon = float(parts[0])
-            gcj_lat = float(parts[1])
-            return gcj_lat, gcj_lon
+            result: list[tuple[float, float]] = []
+            for item in output_pairs:
+                parts = item.split(",")
+                if len(parts) != 2:
+                    raise RuntimeError(f"unexpected AMap coordinate: {item!r}")
+                gcj_lon = float(parts[0])
+                gcj_lat = float(parts[1])
+                result.append((gcj_lat, gcj_lon))
+            return result
 
         except RuntimeError:
             # API errors such as invalid keys or quota failures should not be retried.
@@ -375,6 +402,29 @@ def amap_convert(
     raise RuntimeError(
         f"AMap request failed after {retries + 1} attempts: {last_error}"
     )
+
+
+def amap_convert_all(
+    points: list[dict[str, object]],
+    key: str,
+    timeout: float,
+    retries: int,
+    request_delay: float,
+) -> list[tuple[float, float]]:
+    result: list[tuple[float, float]] = []
+    total_batches = math.ceil(len(points) / AMAP_MAX_BATCH)
+
+    for batch_index, start in enumerate(range(0, len(points), AMAP_MAX_BATCH), start=1):
+        batch = points[start : start + AMAP_MAX_BATCH]
+        print(
+            f"AMap batch {batch_index}/{total_batches}: "
+            f"{len(batch)} point(s)"
+        )
+        result.extend(amap_convert_batch(batch, key, timeout, retries))
+        if request_delay > 0 and batch_index < total_batches:
+            time.sleep(request_delay)
+
+    return result
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -452,6 +502,7 @@ def main() -> int:
         print(f"C source    : {args.c_source}")
         print(f"Compiler    : {compiler}")
         print("AMap key    : [set; hidden]")
+        print("Input       : normalized to 6 decimal places")
         print()
 
         with tempfile.TemporaryDirectory(prefix="eviltransform_amap_") as tmp:
@@ -459,24 +510,29 @@ def main() -> int:
             exe = build_c_runner(compiler, args.c_source, args.c_include, build_dir)
             evil_results = run_c_transform(exe, points)
 
+        amap_results = amap_convert_all(
+            points,
+            key,
+            args.timeout,
+            max(0, args.retries),
+            max(0.0, args.request_delay),
+        )
+
+        if len(amap_results) != len(evil_results):
+            raise RuntimeError("internal result count mismatch")
+
         detail_rows: list[dict[str, object]] = []
         errors: list[float] = []
 
+        print()
         print(f"{'Name':<20} {'Error(m)':>10}")
         print("-" * 31)
 
-        for index, (point, evil) in enumerate(zip(points, evil_results)):
+        for point, evil, amap in zip(points, evil_results, amap_results):
             lat = float(point["lat"])
             lon = float(point["lon"])
             evil_lat, evil_lon = evil
-
-            amap_lat, amap_lon = amap_convert(
-                lat,
-                lon,
-                key,
-                args.timeout,
-                max(0, args.retries),
-            )
+            amap_lat, amap_lon = amap
 
             diff_lat = evil_lat - amap_lat
             diff_lon = evil_lon - amap_lon
@@ -486,8 +542,8 @@ def main() -> int:
             detail_rows.append(
                 {
                     "name": point["name"],
-                    "wgs_lat": f"{lat:.10f}",
-                    "wgs_lon": f"{lon:.10f}",
+                    "wgs_lat": f"{lat:.6f}",
+                    "wgs_lon": f"{lon:.6f}",
                     "evil_gcj_lat": f"{evil_lat:.10f}",
                     "evil_gcj_lon": f"{evil_lon:.10f}",
                     "amap_gcj_lat": f"{amap_lat:.10f}",
@@ -497,10 +553,7 @@ def main() -> int:
                     "error_m": f"{error_m:.6f}",
                 }
             )
-
             print(f"{str(point['name']):<20} {error_m:10.3f}")
-            if args.request_delay > 0 and index + 1 < len(points):
-                time.sleep(args.request_delay)
 
         mean_error = statistics.mean(errors)
         rms_error = math.sqrt(sum(e * e for e in errors) / len(errors))
@@ -530,6 +583,8 @@ def main() -> int:
                 f"{args.max_error_m:.6f}" if threshold_enabled else "disabled",
             ),
             ("validation", "PASS" if passed else "FAIL"),
+            ("amap_input_decimals", AMAP_INPUT_DECIMALS),
+            ("amap_batch_size", AMAP_MAX_BATCH),
             ("compiler", compiler),
             ("c_source", str(args.c_source)),
             ("c_source_sha256", sha256_file(args.c_source)),

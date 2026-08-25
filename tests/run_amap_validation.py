@@ -6,8 +6,12 @@ This is a thin wrapper around validate_amap.py.
 
 Modes:
   smoke: Run a small fixed set of representative points first.
-  full:  Expand the full anchor set into deterministic local grids and run a
-         larger comparison only when explicitly requested.
+  full:  Run a larger comparison only when explicitly requested.
+
+Full strategies:
+  random (default): generate deterministic, approximately area-uniform random
+                    points inside an approximate GCJ distortion-scope polygon.
+  grid:             keep the older local-grid strategy around city anchors.
 
 Only Python standard-library modules are used.
 
@@ -18,12 +22,14 @@ Examples on macOS:
     # Fast sanity check first (default mode)
     python3 tests/run_amap_validation.py --mode smoke
 
-    # Larger validation after smoke passes
+    # Nationwide-style deterministic random validation: 50,000 points
     python3 tests/run_amap_validation.py --mode full
 
-The full mode uses a 5 x 5 grid around each anchor by default. With the
-repository's current 15 anchors this produces 375 points, which requires
-10 AMap requests when the 40-points-per-request limit is used.
+    # Reproduce exactly the same random sample explicitly
+    python3 tests/run_amap_validation.py --mode full --random-count 50000 --seed 20260825
+
+AMap currently accepts at most 40 coordinate pairs per conversion request, so
+50,000 points require 1,250 API requests.
 """
 
 from __future__ import annotations
@@ -36,10 +42,33 @@ from pathlib import Path
 import subprocess
 import sys
 
+from gcj_scope import contains_gcj_scope, scope_bounds
 
+
+DEFAULT_RANDOM_COUNT = 50_000
+DEFAULT_RANDOM_SEED = 20260825
 DEFAULT_GRID_RADIUS = 2
 DEFAULT_GRID_STEP_DEG = 0.05
 AMAP_BATCH_SIZE = 40
+MASK64 = (1 << 64) - 1
+
+
+class SplitMix64:
+    """Small fixed PRNG so generated test coordinates are reproducible."""
+
+    def __init__(self, seed: int) -> None:
+        self.state = seed & MASK64
+
+    def next_u64(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return (z ^ (z >> 31)) & MASK64
+
+    def random(self) -> float:
+        # Use the upper 53 bits, matching double-precision mantissa width.
+        return (self.next_u64() >> 11) * (1.0 / (1 << 53))
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +82,24 @@ def parse_args() -> argparse.Namespace:
         choices=("smoke", "full"),
         default="smoke",
         help="validation stage; default: smoke",
+    )
+    parser.add_argument(
+        "--full-strategy",
+        choices=("random", "grid"),
+        default="random",
+        help="full-mode sampling strategy; default: random",
+    )
+    parser.add_argument(
+        "--random-count",
+        type=int,
+        default=DEFAULT_RANDOM_COUNT,
+        help="full random mode: accepted random points; default: 50000",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        help="full random mode: deterministic 64-bit seed; default: 20260825",
     )
     parser.add_argument(
         "--compiler",
@@ -75,20 +122,20 @@ def parse_args() -> argparse.Namespace:
         "--retries",
         type=int,
         default=2,
-        help="network retries per AMap request",
+        help="network/API transient retries per AMap request",
     )
     parser.add_argument(
         "--request-delay",
         type=float,
-        default=0.05,
-        help="delay between AMap request batches in seconds",
+        default=0.10,
+        help="delay between AMap request batches in seconds; default: 0.10",
     )
     parser.add_argument(
         "--grid-radius",
         type=int,
         default=DEFAULT_GRID_RADIUS,
         help=(
-            "full mode only: number of grid steps around each anchor; "
+            "full grid mode only: number of grid steps around each anchor; "
             "2 means a 5x5 grid"
         ),
     )
@@ -96,7 +143,7 @@ def parse_args() -> argparse.Namespace:
         "--grid-step-deg",
         type=float,
         default=DEFAULT_GRID_STEP_DEG,
-        help="full mode only: latitude/longitude grid spacing in degrees",
+        help="full grid mode only: latitude/longitude grid spacing in degrees",
     )
     parser.add_argument(
         "--smoke-points",
@@ -108,7 +155,7 @@ def parse_args() -> argparse.Namespace:
         "--full-anchors",
         type=Path,
         default=tests_dir / "amap_test_points.csv",
-        help="full-mode anchor CSV",
+        help="full grid mode: anchor CSV",
     )
     parser.add_argument(
         "--output-root",
@@ -158,6 +205,69 @@ def read_points(path: Path) -> list[tuple[str, float, float]]:
     return points
 
 
+def write_random_points(path: Path, count: int, seed: int) -> tuple[int, int]:
+    """Write deterministic random points inside the approximate GCJ scope.
+
+    Longitude is sampled uniformly. Latitude is sampled uniformly in sin(lat),
+    then rejected by the polygon. This approximates uniform sampling by surface
+    area rather than over-weighting high latitudes.
+
+    Coordinates are rounded to 6 decimals before the polygon check and de-dupe,
+    matching the AMap coordinate-conversion input precision.
+    """
+    if count <= 0:
+        raise ValueError("--random-count must be > 0")
+
+    min_lat, max_lat, min_lon, max_lon = scope_bounds()
+    sin_min = math.sin(math.radians(min_lat))
+    sin_max = math.sin(math.radians(max_lat))
+    rng = SplitMix64(seed)
+    seen: set[tuple[float, float]] = set()
+    attempts = 0
+    max_attempts = max(100_000, count * 20)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "wgs_lat", "wgs_lon"])
+
+        while len(seen) < count:
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError(
+                    f"unable to generate {count} random in-scope points after "
+                    f"{attempts} attempts"
+                )
+
+            lon = min_lon + (max_lon - min_lon) * rng.random()
+            sin_lat = sin_min + (sin_max - sin_min) * rng.random()
+            lat = math.degrees(math.asin(sin_lat))
+
+            # AMap's conversion API accepts at most 6 digits after decimal.
+            lat = round(lat, 6)
+            lon = round(lon, 6)
+
+            if not contains_gcj_scope(lat, lon):
+                continue
+
+            key = (lat, lon)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            index = len(seen)
+            writer.writerow(
+                [
+                    f"Random{index:05d}",
+                    f"{lat:.6f}",
+                    f"{lon:.6f}",
+                ]
+            )
+
+    return len(seen), attempts
+
+
 def write_full_grid(
     anchors: list[tuple[str, float, float]],
     path: Path,
@@ -186,6 +296,16 @@ def write_full_grid(
                     count += 1
 
     return count
+
+
+def write_manifest(
+    path: Path,
+    rows: list[tuple[str, object]],
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["parameter", "value"])
+        writer.writerows(rows)
 
 
 def build_core_command(
@@ -235,6 +355,7 @@ def main() -> int:
     try:
         output_dir = args.output_root / args.mode
         output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows: list[tuple[str, object]] = [("mode", args.mode)]
 
         if args.mode == "smoke":
             points_path = args.smoke_points
@@ -242,9 +363,44 @@ def main() -> int:
             point_count = len(points)
             print("Stage        : SMOKE")
             print("Purpose      : verify compiler/API/key/order/basic compatibility")
+            manifest_rows.extend(
+                [
+                    ("strategy", "fixed_smoke_points"),
+                    ("points_file", str(points_path)),
+                ]
+            )
+        elif args.full_strategy == "random":
+            points_path = output_dir / "generated_random_points.csv"
+            point_count, attempts = write_random_points(
+                points_path,
+                args.random_count,
+                args.seed,
+            )
+            acceptance = point_count / attempts if attempts else 0.0
+            print("Stage        : FULL")
+            print("Strategy     : deterministic random / approximate area-uniform")
+            print(f"Seed         : {args.seed}")
+            print("Scope        : approximate GCJ distortion-scope polygon (PRCoords-derived)")
+            print(f"Candidates   : {attempts}")
+            print(f"Acceptance   : {acceptance * 100.0:.2f}%")
+            print(f"Generated CSV: {points_path}")
+            manifest_rows.extend(
+                [
+                    ("strategy", "random_area_uniform_rejection"),
+                    ("random_count", point_count),
+                    ("seed", args.seed),
+                    ("candidate_attempts", attempts),
+                    ("acceptance_ratio", f"{acceptance:.9f}"),
+                    (
+                        "scope",
+                        "PRCoords approximate GCJ distortion scope; not an administrative boundary",
+                    ),
+                    ("points_file", str(points_path)),
+                ]
+            )
         else:
             anchors = read_points(args.full_anchors)
-            points_path = output_dir / "generated_full_points.csv"
+            points_path = output_dir / "generated_full_grid_points.csv"
             point_count = write_full_grid(
                 anchors,
                 points_path,
@@ -253,12 +409,32 @@ def main() -> int:
             )
             side = args.grid_radius * 2 + 1
             print("Stage        : FULL")
+            print("Strategy     : anchor grids")
             print(f"Anchors      : {len(anchors)}")
             print(f"Grid/anchor  : {side} x {side}")
             print(f"Grid step    : {args.grid_step_deg:.6f} deg")
             print(f"Generated CSV: {points_path}")
+            manifest_rows.extend(
+                [
+                    ("strategy", "anchor_grid"),
+                    ("anchor_count", len(anchors)),
+                    ("grid_side", side),
+                    ("grid_step_deg", f"{args.grid_step_deg:.6f}"),
+                    ("points_file", str(points_path)),
+                ]
+            )
 
         batches = math.ceil(point_count / AMAP_BATCH_SIZE)
+        manifest_rows.extend(
+            [
+                ("point_count", point_count),
+                ("amap_batch_size", AMAP_BATCH_SIZE),
+                ("estimated_amap_requests", batches),
+                ("max_error_m", args.max_error_m),
+            ]
+        )
+        write_manifest(output_dir / "sampling_manifest.csv", manifest_rows)
+
         print(f"Points       : {point_count}")
         print(f"AMap batches : {batches} (max {AMAP_BATCH_SIZE} points/request)")
         print(f"Output dir   : {output_dir}")

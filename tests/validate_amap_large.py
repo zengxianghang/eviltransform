@@ -7,7 +7,7 @@ from validate_amap.py, but changes console behavior and AMap retry handling for
 large data sets:
 
 - compact progress instead of printing every point / batch;
-- automatic retry for AMap 10004 ACCESS_TOO_FREQUENT;
+- automatic retry/backoff for AMap minute-window and QPS rate limits;
 - top-N worst points printed at the end;
 - full detailed CSV is still written.
 
@@ -33,9 +33,21 @@ import urllib.request
 import validate_amap as base
 
 
-RATE_LIMIT_BACKOFF_SEC = 61.0
+MINUTE_LIMIT_BACKOFF_SEC = 61.0
+QPS_BACKOFF_BASE_SEC = 1.0
+QPS_RATE_LIMIT_CODES = {
+    "10014",  # QPS_HAS_EXCEEDED_THE_LIMIT
+    "10015",  # GATEWAY_TIMEOUT / single-machine QPS limiting
+    "10019",  # CQPS_HAS_EXCEEDED_THE_LIMIT
+    "10020",  # CKQPS_HAS_EXCEEDED_THE_LIMIT
+    "10021",  # CUQPS_HAS_EXCEEDED_THE_LIMIT
+    "10022",  # CIKQPS_HAS_EXCEEDED_THE_LIMIT
+    "10023",  # KQPS_HAS_EXCEEDED_THE_LIMIT
+}
 DEFAULT_TOP_ERRORS = 20
 DEFAULT_COMPARE_PROGRESS = 5000
+DEFAULT_REQUEST_DELAY_SEC = 0.50
+DEFAULT_RETRIES = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +80,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compiler", default=None)
     parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--request-delay", type=float, default=0.10)
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY_SEC,
+        help="delay between AMap requests in seconds (default: 0.50)",
+    )
     parser.add_argument("--max-error-m", type=float, default=5.0)
     parser.add_argument("--top-errors", type=int, default=DEFAULT_TOP_ERRORS)
     parser.add_argument(
@@ -105,7 +122,7 @@ def amap_convert_batch_large(
     )
     request = urllib.request.Request(
         f"{base.AMAP_URL}?{params}",
-        headers={"User-Agent": "eviltransform-amap-validator/large-1.0"},
+        headers={"User-Agent": "eviltransform-amap-validator/large-1.1"},
     )
 
     last_error: Exception | None = None
@@ -126,15 +143,32 @@ def amap_convert_batch_large(
                 if infocode == "10004":
                     rate_limit_events += 1
                     last_error = RuntimeError(
-                        f"AMap API rate limited: {info} (infocode={infocode})"
+                        f"AMap minute-window rate limit: {info} (infocode={infocode})"
                     )
                     if attempt < retries:
                         print(
-                            "AMap rate limit (10004); backing off before retry...",
+                            "AMap minute-window rate limit (10004); "
+                            f"backing off {MINUTE_LIMIT_BACKOFF_SEC:.0f}s before retry...",
                             file=sys.stderr,
                             flush=True,
                         )
-                        time.sleep(RATE_LIMIT_BACKOFF_SEC)
+                        time.sleep(MINUTE_LIMIT_BACKOFF_SEC)
+                        continue
+
+                if infocode in QPS_RATE_LIMIT_CODES:
+                    rate_limit_events += 1
+                    last_error = RuntimeError(
+                        f"AMap QPS rate limit: {info} (infocode={infocode})"
+                    )
+                    if attempt < retries:
+                        backoff = QPS_BACKOFF_BASE_SEC * (2**attempt)
+                        print(
+                            f"AMap QPS rate limit ({infocode}); "
+                            f"backing off {backoff:.1f}s before retry...",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        time.sleep(backoff)
                         continue
 
                 raise RuntimeError(
@@ -243,6 +277,8 @@ def main() -> int:
         print(f"Compiler    : {compiler}")
         print("AMap key    : [set; hidden]")
         print("Console     : compact large-sample mode")
+        print(f"Request delay: {max(0.0, args.request_delay):.3f} s")
+        print(f"Retries      : {max(0, args.retries)}")
         print()
 
         with tempfile.TemporaryDirectory(prefix="eviltransform_amap_large_") as tmp:
@@ -338,6 +374,7 @@ def main() -> int:
             ("validation", "PASS" if passed else "FAIL"),
             ("amap_input_decimals", base.AMAP_INPUT_DECIMALS),
             ("amap_batch_size", base.AMAP_MAX_BATCH),
+            ("amap_request_delay_sec", f"{max(0.0, args.request_delay):.3f}"),
             ("amap_request_attempts", request_attempts),
             ("amap_rate_limit_events", rate_limit_events),
             ("compiler", compiler),

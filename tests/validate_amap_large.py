@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """Large-sample AMap validator for eviltransform.
 
-This module reuses the already smoke-tested C compile/transform and CSV helpers
-from validate_amap.py, but changes console behavior and AMap retry handling for
-large data sets:
+This validator is intended for tens of thousands of points.  It reuses the
+already smoke-tested C compile/transform helpers from validate_amap.py and adds:
 
-- compact progress instead of printing every point / batch;
-- automatic retry/backoff for AMap minute-window and QPS rate limits;
-- top-N worst points printed at the end;
-- full detailed CSV is still written.
+- compact progress output;
+- automatic retry/backoff for AMap QPS/minute rate limits;
+- a persistent coordinate-keyed AMap reference cache;
+- per-batch flush + fsync so interrupted runs can resume safely;
+- top-N worst points while still writing the complete detailed CSV.
 
 Only Python standard-library modules are used.
 """
@@ -17,6 +17,7 @@ Only Python standard-library modules are used.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -36,18 +37,19 @@ import validate_amap as base
 MINUTE_LIMIT_BACKOFF_SEC = 61.0
 QPS_BACKOFF_BASE_SEC = 1.0
 QPS_RATE_LIMIT_CODES = {
-    "10014",  # QPS_HAS_EXCEEDED_THE_LIMIT
-    "10015",  # GATEWAY_TIMEOUT / single-machine QPS limiting
-    "10019",  # CQPS_HAS_EXCEEDED_THE_LIMIT
-    "10020",  # CKQPS_HAS_EXCEEDED_THE_LIMIT
-    "10021",  # CUQPS_HAS_EXCEEDED_THE_LIMIT
-    "10022",  # CIKQPS_HAS_EXCEEDED_THE_LIMIT
-    "10023",  # KQPS_HAS_EXCEEDED_THE_LIMIT
+    "10014",
+    "10015",
+    "10019",
+    "10020",
+    "10021",
+    "10022",
+    "10023",
 }
 DEFAULT_TOP_ERRORS = 20
 DEFAULT_COMPARE_PROGRESS = 5000
 DEFAULT_REQUEST_DELAY_SEC = 0.50
 DEFAULT_RETRIES = 5
+CACHE_FIELDS = ["wgs_lat", "wgs_lon", "amap_gcj_lat", "amap_gcj_lon"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,26 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Large-sample eviltransform C vs AMap validation."
     )
+    parser.add_argument("--points", type=Path, required=True)
+    parser.add_argument("--c-source", type=Path, default=repo_root / "c" / "transform.c")
+    parser.add_argument("--c-include", type=Path, default=repo_root / "c")
     parser.add_argument(
-        "--points",
-        type=Path,
-        required=True,
-        help="input CSV with name,wgs_lat,wgs_lon",
-    )
-    parser.add_argument(
-        "--c-source",
-        type=Path,
-        default=repo_root / "c" / "transform.c",
-    )
-    parser.add_argument(
-        "--c-include",
-        type=Path,
-        default=repo_root / "c",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=tests_dir / "output" / "full",
+        "--output-dir", type=Path, default=tests_dir / "output" / "full"
     )
     parser.add_argument("--compiler", default=None)
     parser.add_argument("--timeout", type=float, default=15.0)
@@ -95,7 +82,83 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_COMPARE_PROGRESS,
         help="print comparison progress every N points; 0 disables",
     )
+    parser.add_argument(
+        "--cache-file",
+        type=Path,
+        default=None,
+        help="persistent AMap reference cache; default: <output-dir>/amap_reference_cache.csv",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="discard the existing cache before querying AMap",
+    )
     return parser.parse_args()
+
+
+def coord_key(point: dict[str, object]) -> tuple[str, str]:
+    return (f"{float(point['lat']):.6f}", f"{float(point['lon']):.6f}")
+
+
+def load_cache(path: Path) -> dict[tuple[str, str], tuple[float, float]]:
+    cache: dict[tuple[str, str], tuple[float, float]] = {}
+    if not path.is_file():
+        return cache
+
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if set(CACHE_FIELDS) - set(reader.fieldnames or []):
+            raise ValueError(
+                f"cache file has incompatible columns: {path}; found {reader.fieldnames}"
+            )
+        for line_no, row in enumerate(reader, start=2):
+            try:
+                lat = f"{float(row['wgs_lat']):.6f}"
+                lon = f"{float(row['wgs_lon']):.6f}"
+                amap_lat = float(row["amap_gcj_lat"])
+                amap_lon = float(row["amap_gcj_lon"])
+            except (TypeError, ValueError, KeyError):
+                print(
+                    f"WARNING: ignoring malformed cache row {line_no} in {path}",
+                    file=sys.stderr,
+                )
+                continue
+            if not (math.isfinite(amap_lat) and math.isfinite(amap_lon)):
+                print(
+                    f"WARNING: ignoring non-finite cache row {line_no} in {path}",
+                    file=sys.stderr,
+                )
+                continue
+            cache[(lat, lon)] = (amap_lat, amap_lon)
+    return cache
+
+
+def append_cache_batch(
+    path: Path,
+    points: list[dict[str, object]],
+    results: list[tuple[float, float]],
+) -> None:
+    if len(points) != len(results):
+        raise ValueError("cache append point/result count mismatch")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    need_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CACHE_FIELDS)
+        if need_header:
+            writer.writeheader()
+        for point, (amap_lat, amap_lon) in zip(points, results):
+            lat, lon = coord_key(point)
+            writer.writerow(
+                {
+                    "wgs_lat": lat,
+                    "wgs_lon": lon,
+                    "amap_gcj_lat": f"{amap_lat:.10f}",
+                    "amap_gcj_lon": f"{amap_lon:.10f}",
+                }
+            )
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def amap_convert_batch_large(
@@ -122,7 +185,7 @@ def amap_convert_batch_large(
     )
     request = urllib.request.Request(
         f"{base.AMAP_URL}?{params}",
-        headers={"User-Agent": "eviltransform-amap-validator/large-1.1"},
+        headers={"User-Agent": "eviltransform-amap-validator/large-1.2"},
     )
 
     last_error: Exception | None = None
@@ -171,9 +234,7 @@ def amap_convert_batch_large(
                         time.sleep(backoff)
                         continue
 
-                raise RuntimeError(
-                    f"AMap API error: {info} (infocode={infocode})"
-                )
+                raise RuntimeError(f"AMap API error: {info} (infocode={infocode})")
 
             locations_out = data.get("locations")
             if not isinstance(locations_out, str):
@@ -191,7 +252,6 @@ def amap_convert_batch_large(
                 if len(parts) != 2:
                     raise RuntimeError(f"unexpected AMap coordinate: {item!r}")
                 result.append((float(parts[1]), float(parts[0])))
-
             return result, request_attempts, rate_limit_events
 
         except RuntimeError:
@@ -212,49 +272,67 @@ def amap_convert_batch_large(
     )
 
 
-def amap_convert_all_large(
+def amap_convert_all_cached(
     points: list[dict[str, object]],
     key: str,
     timeout: float,
     retries: int,
     request_delay: float,
-) -> tuple[list[tuple[float, float]], int, int]:
-    result: list[tuple[float, float]] = []
-    total_batches = math.ceil(len(points) / base.AMAP_MAX_BATCH)
-    progress_step = max(1, total_batches // 20)
+    cache_path: Path,
+) -> tuple[list[tuple[float, float]], int, int, int, int]:
+    cache = load_cache(cache_path)
+    cached_before = sum(1 for point in points if coord_key(point) in cache)
+    missing = [point for point in points if coord_key(point) not in cache]
+
+    print(f"AMap cache   : {cache_path}")
+    print(f"Cache hits   : {cached_before}/{len(points)}")
+    print(f"Need fetch   : {len(missing)} point(s)")
+
+    total_batches = math.ceil(len(missing) / base.AMAP_MAX_BATCH) if missing else 0
+    progress_step = max(1, total_batches // 20) if total_batches else 1
     request_attempts = 0
     rate_limit_events = 0
+    fetched_points = 0
 
     for batch_index, start in enumerate(
-        range(0, len(points), base.AMAP_MAX_BATCH), start=1
+        range(0, len(missing), base.AMAP_MAX_BATCH), start=1
     ):
-        batch = points[start : start + base.AMAP_MAX_BATCH]
+        batch = missing[start : start + base.AMAP_MAX_BATCH]
         batch_result, batch_requests, batch_rate_limits = amap_convert_batch_large(
-            batch,
-            key,
-            timeout,
-            retries,
+            batch, key, timeout, retries
         )
-        result.extend(batch_result)
+
+        # Persist each successful batch before doing any further network work.
+        append_cache_batch(cache_path, batch, batch_result)
+        for point, result in zip(batch, batch_result):
+            cache[coord_key(point)] = result
+
         request_attempts += batch_requests
         rate_limit_events += batch_rate_limits
+        fetched_points += len(batch)
 
         if (
             batch_index == 1
             or batch_index == total_batches
             or batch_index % progress_step == 0
         ):
-            done_points = min(batch_index * base.AMAP_MAX_BATCH, len(points))
             print(
-                f"AMap progress: {batch_index}/{total_batches} batches, "
-                f"{done_points}/{len(points)} points",
+                f"AMap fetch progress: {batch_index}/{total_batches} batches, "
+                f"{fetched_points}/{len(missing)} missing points fetched",
                 flush=True,
             )
 
         if request_delay > 0 and batch_index < total_batches:
             time.sleep(request_delay)
 
-    return result, request_attempts, rate_limit_events
+    result: list[tuple[float, float]] = []
+    for point in points:
+        cached = cache.get(coord_key(point))
+        if cached is None:
+            raise RuntimeError(f"internal cache miss after fetch: {coord_key(point)}")
+        result.append(cached)
+
+    return result, request_attempts, rate_limit_events, cached_before, fetched_points
 
 
 def main() -> int:
@@ -271,33 +349,41 @@ def main() -> int:
         points = base.read_points(args.points)
         compiler = base.find_compiler(args.compiler)
         args.output_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = args.cache_file or (args.output_dir / "amap_reference_cache.csv")
 
-        print(f"Test points : {len(points)}")
-        print(f"C source    : {args.c_source}")
-        print(f"Compiler    : {compiler}")
-        print("AMap key    : [set; hidden]")
-        print("Console     : compact large-sample mode")
+        if args.refresh_cache and cache_path.exists():
+            cache_path.unlink()
+            print(f"Cache refresh : removed {cache_path}")
+
+        print(f"Test points  : {len(points)}")
+        print(f"C source     : {args.c_source}")
+        print(f"Compiler     : {compiler}")
+        print("AMap key     : [set; hidden]")
+        print("Console      : compact large-sample mode")
         print(f"Request delay: {max(0.0, args.request_delay):.3f} s")
         print(f"Retries      : {max(0, args.retries)}")
         print()
 
         with tempfile.TemporaryDirectory(prefix="eviltransform_amap_large_") as tmp:
             exe = base.build_c_runner(
-                compiler,
-                args.c_source,
-                args.c_include,
-                Path(tmp),
+                compiler, args.c_source, args.c_include, Path(tmp)
             )
             evil_results = base.run_c_transform(exe, points)
+        print(f"C transform  : completed {len(evil_results)} points")
 
-        print(f"C transform : completed {len(evil_results)} points")
-
-        amap_results, request_attempts, rate_limit_events = amap_convert_all_large(
+        (
+            amap_results,
+            request_attempts,
+            rate_limit_events,
+            cache_hits,
+            fetched_points,
+        ) = amap_convert_all_cached(
             points,
             key,
             args.timeout,
             max(0, args.retries),
             max(0.0, args.request_delay),
+            cache_path,
         )
 
         if len(amap_results) != len(evil_results):
@@ -315,15 +401,11 @@ def main() -> int:
             lon = float(point["lon"])
             evil_lat, evil_lon = evil
             amap_lat, amap_lon = amap
-
             diff_lat = evil_lat - amap_lat
             diff_lon = evil_lon - amap_lon
-            error_m = base.haversine_m(
-                evil_lat, evil_lon, amap_lat, amap_lon
-            )
+            error_m = base.haversine_m(evil_lat, evil_lon, amap_lat, amap_lon)
             errors.append(error_m)
             worst_rows.append((error_m, str(point["name"]), lat, lon))
-
             detail_rows.append(
                 {
                     "name": point["name"],
@@ -338,7 +420,6 @@ def main() -> int:
                     "error_m": f"{error_m:.6f}",
                 }
             )
-
             if progress_every and (
                 index % progress_every == 0 or index == len(points)
             ):
@@ -351,7 +432,6 @@ def main() -> int:
         max_error = max(errors)
         worst_index = errors.index(max_error)
         worst_name = str(points[worst_index]["name"])
-
         threshold_enabled = args.max_error_m > 0
         passed = (not threshold_enabled) or max_error <= args.max_error_m
 
@@ -375,8 +455,11 @@ def main() -> int:
             ("amap_input_decimals", base.AMAP_INPUT_DECIMALS),
             ("amap_batch_size", base.AMAP_MAX_BATCH),
             ("amap_request_delay_sec", f"{max(0.0, args.request_delay):.3f}"),
-            ("amap_request_attempts", request_attempts),
-            ("amap_rate_limit_events", rate_limit_events),
+            ("amap_request_attempts_this_run", request_attempts),
+            ("amap_rate_limit_events_this_run", rate_limit_events),
+            ("amap_cache_file", str(cache_path)),
+            ("amap_cache_hits_at_start", cache_hits),
+            ("amap_points_fetched_this_run", fetched_points),
             ("compiler", compiler),
             ("c_source", str(args.c_source)),
             ("c_source_sha256", base.sha256_file(args.c_source)),
@@ -391,8 +474,10 @@ def main() -> int:
         print(f"P95   : {p95:.3f} m")
         print(f"P99   : {p99:.3f} m")
         print(f"Max   : {max_error:.3f} m ({worst_name})")
-        print(f"AMap requests (incl. retries): {request_attempts}")
-        print(f"Rate-limit events           : {rate_limit_events}")
+        print(f"Cache hits at start          : {cache_hits}")
+        print(f"AMap points fetched this run : {fetched_points}")
+        print(f"AMap requests incl. retries  : {request_attempts}")
+        print(f"Rate-limit events this run   : {rate_limit_events}")
         if threshold_enabled:
             print(f"Limit : {args.max_error_m:.3f} m")
         print(f"Result: {'PASS' if passed else 'FAIL'}")
@@ -402,15 +487,13 @@ def main() -> int:
             print()
             print(f"========== Worst {top_n} points ==========")
             print(f"{'Name':<14} {'Error(m)':>10} {'WGS lat':>12} {'WGS lon':>13}")
-            for error_m, name, lat, lon in sorted(
-                worst_rows, reverse=True
-            )[:top_n]:
+            for error_m, name, lat, lon in sorted(worst_rows, reverse=True)[:top_n]:
                 print(f"{name:<14} {error_m:10.3f} {lat:12.6f} {lon:13.6f}")
 
         print()
+        print(f"AMap cache  : {cache_path}")
         print(f"Detailed CSV: {result_path}")
         print(f"Summary CSV : {summary_path}")
-
         return 0 if passed else 2
 
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
